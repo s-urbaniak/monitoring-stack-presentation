@@ -1,0 +1,154 @@
+OpenShift Monitoring Stack
+
+May 6th 2021
+
+Sergiusz Urbaniak
+
+* Deployment chain
+
+1. OpenShift installer
+2. CVO (Cluster Version Operator)
+3. CMO (Cluster Monitoring Operator)
+4. PO  (Prometheus Operator)
+
+* Deployment chain
+
+Cluster Version Operator sources `/manifests/*.yaml`
+
+Cluster Monitoring Operator sources `/assets/**/*.yaml` as `bindata.go`
+
+deploys:
+- grafana
+- kube-state-metrics
+- openshift-state-metrics
+- prometheus-adapter
+- telemeter-client
+- node-exporter
+- thanos-querier
+- in-cluster prometheus-operator
+- (optional) user workload prometheus-operator
+
+* Prometheus Operator
+
+prometheus-operator is deployed twice, for two tenants:
+
+- in-cluster monitoring
+- (optional) user workload monitoring
+
+.link https://docs.openshift.com/container-platform/4.7/monitoring/understanding-the-monitoring-stack.html
+
+* Prometheus Operator CRDs
+
+Immutable for users:
+- `Alertmanager` (only in-cluster)
+- `Prometheus` (in-cluster, user-workload)
+- `ThanosRuler` (only user-workload)
+
+Mutable for OpenShift components (in-cluster) and users (user workload monitoring)
+- `Probe`
+- `PodMonitor`
+- `ServiceMonitor`
+- `PrometheusRule`
+
+* OLM (sigh)
+
+Users can install prometheus-operator via OLM as well
+
+.link https://github.com/operator-framework/community-operators/tree/master/community-operators/prometheus
+
+- Unsupported by monitoring team
+- Mutually exclusive with user workload monitoring
+- Source of bugs and conflicts
+
+* Console
+
+.link https://github.com/openshift/console
+
+- biggest client of monitoring stack
+- provides alert dashboards
+- provides metrics dashboards
+- executes a lot of queriers against the monitoring stack
+
+* Kubernetes Metrics API
+
+central actor: prometheus-adapter
+
+  $ kubectl -n foo top pod
+  GET /apis/metrics.k8s.io/v1beta1/namespaces/foo/pods
+          |
+          v
+  kube-aggregator (inside kube-apiserver)
+          |
+          | dispatch to aggregated API-server
+          v
+  prometheus-adapter
+          |
+          | translate into prometheus query
+          v
+  thanos-querier
+
+.link https://medium.com/@vanSadhu/kubernetes-api-aggregation-setup-nuts-bolts-733fef22a504
+
+* Access to Prometheus/Alertmanager/Thanos GUI
+
+Via external routes:
+
+- Cluster admins only
+- Needs `namespaces/get` binding
+
+  Ingress https request
+          |
+          v
+  :9091 (tls) prometheus-proxy (aka oauth-proxy)
+          |
+          v
+  :9090 (http) prometheus
+
+* Soft Tenancy / RBAC
+
+- In-cluster applications
+- Developer persona users
+
+  Console https request
+          |
+          v
+  :9092 (tls) kube-rbac-proxy
+          |
+          | inject request parameter `namespace`
+          | configured via openshift-monitoring/kube-rbac-proxy secret
+          |
+          v
+  :9095 (http) prom-label-proxy
+          |
+          | enforce queries with `namespace` label 
+          |
+          v
+  :9090 (http) prometheus
+
+* Soft Tenancy configuration
+
+  $ kubectl -n openshift-monitoring get secret kube-rbac-proxy -o jsonpath='{.data.config\.yaml}' \
+    | base64 -d; echo
+  "authorization":
+    "resourceAttributes":
+      "apiVersion": "metrics.k8s.io/v1beta1"
+      "namespace": "{{ .Value }}"
+      "resource": "pods"
+    "rewrites":
+      "byQueryParameter":
+        "name": "namespace"
+
+The above config declares the question:
+
+"Is the in-flight bearer token authorized to [http-verb] (i.e. GET) pod metrics for the given request URL parameter named `namespace`?"
+
+aka
+
+  $ kubectl [http-verb] (i.e. get) pods.metrics.k8s.io
+
+* Soft Tenancy configuration
+
+Executed steps:
+1. Execute k8s Subject Access Review (SAR) using in-flight bearer token against the following attributes:
+a) verb: take in-flight HTTP verb (i.e. GET/POST/PUT)
+b) resource attributes: templated from in-flight http request query parameter named "namespace"
